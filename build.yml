@@ -1,0 +1,1384 @@
+# মুন্না এআই: এই একটা ফাইলই পুরো অ্যাপ বানিয়ে APK তৈরি করে।
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.personal.ai"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.personal.ai"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk {
+                      abiFilters += "arm64-v8a"
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+          }
+
+          kotlin {
+              jvmToolchain(17)
+              compilerOptions {
+                  freeCompilerArgs.add("-Xskip-metadata-version-check")
+              }
+          }
+
+          dependencies {
+              implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          __EOF__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+              <uses-feature android:name="android.hardware.telephony" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="মুন্না এআই"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <uses-native-library
+                      android:name="libvndksupport.so"
+                      android:required="false" />
+                  <uses-native-library
+                      android:name="libOpenCL.so"
+                      android:required="false" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.ASSIST" />
+                          <action android:name="android.intent.action.VOICE_COMMAND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AssistService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION">
+                      <meta-data
+                          android:name="android.voice_interaction"
+                          android:resource="@xml/voice_interaction_service" />
+                      <intent-filter>
+                          <action android:name="android.service.voice.VoiceInteractionService" />
+                      </intent-filter>
+                  </service>
+                  <service
+                      android:name=".AssistSessionService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION" />
+                  <service
+                      android:name=".StubRecognitionService"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.speech.RecognitionService" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p 'app/src/main/java/com/personal/ai'
+          cat > 'app/src/main/java/com/personal/ai/Llm.kt' <<'__EOF__'
+          package com.personal.ai
+
+          import android.content.Context
+          import com.google.ai.edge.litertlm.Backend
+          import com.google.ai.edge.litertlm.Contents
+          import com.google.ai.edge.litertlm.ConversationConfig
+          import com.google.ai.edge.litertlm.Engine
+          import com.google.ai.edge.litertlm.EngineConfig
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.map
+          import java.io.File
+
+          /** অফলাইন মডেল (LiteRT-LM) সামলায়। */
+          class Llm(private val ctx: Context) {
+              private var engine: Engine? = null
+              private var sender: ((String) -> Flow<String>)? = null
+              private var pendingSystem: String? = null
+              private var closer: (() -> Unit)? = null
+
+              var backendName: String = ""
+                  private set
+
+              val modelFile: File get() = File(ctx.filesDir, "model.litertlm")
+              val ready: Boolean get() = sender != null
+
+              /** preferred: "GPU" বা "CPU"। CPU বেছে নিলে শুধু CPU, GPU বেছে নিলে ব্যর্থ হলে CPU। */
+              fun load(system: String, preferred: String) {
+                  close()
+                  val order = if (preferred == "CPU") listOf("CPU") else listOf("GPU", "CPU")
+                  var last: Throwable? = null
+                  for (name in order) {
+                      try {
+                          val backend = if (name == "GPU") Backend.GPU() else Backend.CPU()
+                          val e = Engine(EngineConfig(modelPath = modelFile.absolutePath, backend = backend))
+                          try {
+                              e.initialize()
+                          } catch (t: Throwable) {
+                              try { e.close() } catch (_: Throwable) {}
+                              throw t
+                          }
+                          engine = e
+                          backendName = name
+                          newConversation(system)
+                          return
+                      } catch (t: Throwable) {
+                          last = t
+                      }
+                  }
+                  throw last ?: IllegalStateException("মডেল লোড হয়নি")
+              }
+
+              fun newConversation(system: String) {
+                  val e = engine ?: return
+                  try { closer?.invoke() } catch (_: Throwable) {}
+                  val conv = e.createConversation()
+                  pendingSystem = system
+                  sender = { msg -> conv.sendMessageAsync(msg).map { it.toString() } }
+                  closer = { conv.close() }
+              }
+
+              fun ask(msg: String): Flow<String> {
+                  val s = pendingSystem
+                  pendingSystem = null
+                  val full = if (s != null) "[নির্দেশনা]\n$s\n\n[ব্যবহারকারীর কথা]\n$msg" else msg
+                  return sender!!.invoke(full)
+              }
+
+              fun close() {
+                  try { closer?.invoke() } catch (_: Throwable) {}
+                  try { engine?.close() } catch (_: Throwable) {}
+                  closer = null
+                  sender = null
+                  engine = null
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/personal/ai'
+          cat > 'app/src/main/java/com/personal/ai/MainActivity.kt' <<'__EOF__'
+          package com.personal.ai
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.speech.RecognizerIntent
+          import android.speech.tts.TextToSpeech
+          import android.view.Gravity
+          import android.view.Menu
+          import android.view.MenuItem
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.flow.flowOn
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.time.LocalDateTime
+          import java.time.format.DateTimeFormatter
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+              private lateinit var chat: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var llm: Llm
+              private lateinit var phone: PhoneControl
+              private val prefs by lazy { getSharedPreferences("ai", MODE_PRIVATE) }
+
+              private var tts: TextToSpeech? = null
+              private var speak = false
+              private var busy = false
+
+              private val url4b =
+                  "https://huggingface.co/litert-community/Qwen3-4B-Instruct-2507/resolve/main/qwen3_4b_instruct_2507_mixed_int4.litertlm"
+              private val url06b =
+                  "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/qwen3_0_6b_mixed_int4.litertlm"
+              private val reqSpeech = 21
+              private val reqFile = 22
+
+              // ------------------------------------------------------------ শুরু
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  title = "মুন্না এআই"
+                  llm = Llm(this)
+                  phone = PhoneControl(this)
+                  buildUi()
+
+                  tts = TextToSpeech(this) { st ->
+                      if (st == TextToSpeech.SUCCESS) tts?.language = Locale("bn", "BD")
+                  }
+
+                  val missing = listOf(
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.READ_CONTACTS,
+                      Manifest.permission.SEND_SMS
+                  ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
+
+                  // আগেরবার মডেল চালু করতে গিয়ে অ্যাপ ক্র্যাশ করলে অন্য ব্যাকএন্ড চেষ্টা
+                  if (prefs.getBoolean("loading", false)) {
+                      val cur = prefs.getString("backend", "CPU") ?: "CPU"
+                      val next = if (cur == "GPU") "CPU" else "GPU"
+                      prefs.edit().putString("backend", next).putBoolean("loading", false).apply()
+                      bubble("আগেরবার মডেল চালু করতে অ্যাপ বন্ধ হয়ে গিয়েছিল, এবার ${next} দিয়ে চেষ্টা করছি।", false)
+                  }
+
+                  if (phone.name().isBlank()) {
+                      val et = EditText(this).apply { hint = "আপনার নাম" }
+                      AlertDialog.Builder(this)
+                          .setTitle("আপনার নাম কী?")
+                          .setView(et)
+                          .setCancelable(false)
+                          .setPositiveButton("ঠিক আছে") { _, _ ->
+                              phone.setName(et.text.toString().trim().ifBlank { "বন্ধু" })
+                              startFlow()
+                          }
+                          .show()
+                  } else {
+                      startFlow()
+                  }
+                  handleLaunch(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleLaunch(intent)
+              }
+
+              /** অ্যাসিস্ট্যান্ট বা ভয়েস কমান্ড থেকে খুললে সঙ্গে সঙ্গে মাইক চালু। */
+              private fun handleLaunch(i: Intent?) {
+                  if (i == null) return
+                  val wants = i.getBooleanExtra("listen", false) ||
+                      i.action == Intent.ACTION_ASSIST ||
+                      i.action == Intent.ACTION_VOICE_COMMAND
+                  if (!wants) return
+                  i.removeExtra("listen")
+                  i.action = Intent.ACTION_MAIN
+                  input.postDelayed({ listen() }, 500)
+              }
+
+              private fun startFlow() {
+                  bubble("হ্যালো ${phone.name()}! 'সাহায্য' লিখলে কমান্ডের তালিকা পাবেন। ফোন কমান্ড এখনই কাজ করবে।", false)
+                  if (llm.modelFile.exists()) {
+                      loadModel()
+                  } else {
+                      bubble("চ্যাটের জন্য একটা অফলাইন মডেল দরকার। বেছে নিন:", false)
+                      chooseModel()
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  scope.cancel()
+                  llm.close()
+                  tts?.shutdown()
+              }
+
+              // ------------------------------------------------------------ UI
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xFFF2F3F7.toInt())
+                  }
+                  scroll = ScrollView(this)
+                  chat = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                  }
+                  scroll.addView(chat)
+                  root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(8), dp(6), dp(8), dp(6))
+                      setBackgroundColor(Color.WHITE)
+                  }
+                  val mic = Button(this).apply {
+                      text = "🎤"
+                      setOnClickListener { listen() }
+                  }
+                  input = EditText(this).apply {
+                      hint = "কিছু বলুন বা লিখুন..."
+                      maxLines = 4
+                  }
+                  val send = Button(this).apply {
+                      text = "পাঠান"
+                      setOnClickListener {
+                          val t = input.text.toString().trim()
+                          if (t.isNotEmpty()) {
+                              input.setText("")
+                              onSend(t)
+                          }
+                      }
+                  }
+                  bar.addView(mic, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  bar.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  bar.addView(send, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  root.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  setContentView(root)
+              }
+
+              private fun bubble(text: String, user: Boolean): TextView {
+                  val tv = TextView(this).apply {
+                      setText(text)
+                      textSize = 16f
+                      setTextColor(if (user) Color.WHITE else 0xFF1B1B1F.toInt())
+                      setPadding(dp(14), dp(10), dp(14), dp(10))
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(18).toFloat()
+                          setColor(if (user) 0xFF3B6FD4.toInt() else Color.WHITE)
+                      }
+                      setTextIsSelectable(true)
+                      maxWidth = (resources.displayMetrics.widthPixels * 0.85).toInt()
+                  }
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply {
+                      topMargin = dp(6)
+                      gravity = if (user) Gravity.END else Gravity.START
+                  }
+                  chat.addView(tv, lp)
+                  scrollDown()
+                  return tv
+              }
+
+              private fun scrollDown() {
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+              // ------------------------------------------------------------ মেনু
+              override fun onCreateOptionsMenu(menu: Menu): Boolean {
+                  menu.add(0, 1, 0, "নতুন চ্যাট")
+                  menu.add(0, 2, 0, "মডেল নামান / বদলান")
+                  menu.add(0, 3, 0, "ফোনের ফাইল থেকে মডেল")
+                  menu.add(0, 4, 0, "কথা বলে উত্তর চালু/বন্ধ")
+                  menu.add(0, 5, 0, "CPU/GPU বদলান")
+                  menu.add(0, 6, 0, "আমার নোট দেখুন")
+                  menu.add(0, 7, 0, "সব নোট মুছুন")
+                  menu.add(0, 8, 0, "সাহায্য")
+                  return true
+              }
+
+              override fun onOptionsItemSelected(item: MenuItem): Boolean {
+                  when (item.itemId) {
+                      1 -> {
+                          chat.removeAllViews()
+                          refreshConversation()
+                          bubble("নতুন চ্যাট শুরু হলো।", false)
+                      }
+                      2 -> chooseModel()
+                      3 -> pickFile()
+                      4 -> {
+                          speak = !speak
+                          toast(if (speak) "এখন থেকে উত্তর বলে শোনাব" else "বলা বন্ধ")
+                      }
+                      5 -> {
+                          val cur = prefs.getString("backend", "CPU") ?: "CPU"
+                          val next = if (cur == "GPU") "CPU" else "GPU"
+                          prefs.edit().putString("backend", next).apply()
+                          bubble("পরের বার মডেল ${next} দিয়ে চালু হবে। এখনই চালু করছি...", false)
+                          if (llm.modelFile.exists() && !busy) loadModel()
+                      }
+                      6 -> {
+                          val n = phone.notes()
+                          bubble(if (n.isEmpty()) "এখনো কিছু মনে রাখিনি।" else n.joinToString("\n") { "• $it" }, false)
+                      }
+                      7 -> {
+                          phone.clearNotes()
+                          refreshConversation()
+                          bubble("সব নোট মুছে ফেললাম।", false)
+                      }
+                      8 -> bubble(phone.help, false)
+                  }
+                  return true
+              }
+
+              // ------------------------------------------------------------ কথোপকথন
+              private fun systemPrompt(): String {
+                  val notes = phone.notes().joinToString("\n") { "- $it" }.ifEmpty { "(কিছু নেই)" }
+                  val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm"))
+                  val who = phone.name().ifBlank { "ব্যবহারকারী" }
+                  return "তোমার নাম মুন্না এআই। তুমি ${who}-এর ব্যক্তিগত এআই সহকারী। এখন সময়: ${now}।\n" +
+                      "ব্যবহারকারী যে ভাষায় লেখে সেই ভাষায় (বাংলা হলে বাংলায়) ছোট ও পরিষ্কার উত্তর দাও। " +
+                      "না জানলে বানিয়ে বলো না, স্বীকার করো।\n" +
+                      "ব্যবহারকারী সম্পর্কে যা মনে রাখতে বলেছে:\n$notes"
+              }
+
+              private fun refreshConversation() {
+                  if (!llm.ready || busy) return
+                  scope.launch(Dispatchers.IO) {
+                      try {
+                          llm.newConversation(systemPrompt())
+                      } catch (_: Throwable) {
+                      }
+                  }
+              }
+
+              private fun cleanThink(s: String): String {
+                  var r = s.replace(Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL), "")
+                  val i = r.indexOf("<think>")
+                  if (i >= 0) r = r.substring(0, i)
+                  return r.trim().ifEmpty { "…" }
+              }
+
+              private fun speakOut(s: String) {
+                  if (speak && s.isNotBlank()) tts?.speak(s.take(400), TextToSpeech.QUEUE_FLUSH, null, "ai")
+              }
+
+              private fun onSend(text: String) {
+                  bubble(text, true)
+
+                  // ১) ফোন কমান্ড (মডেল ছাড়াই, অফলাইনে)
+                  val r = phone.handle(text)
+                  if (r != null) {
+                      bubble(r, false)
+                      speakOut(r)
+                      if (phone.notesChanged) {
+                          phone.notesChanged = false
+                          refreshConversation()
+                      }
+                      return
+                  }
+
+                  // ২) সাধারণ প্রশ্ন -> মডেল (দরকার হলে ইন্টারনেট থেকে তথ্য নিয়ে)
+                  if (busy) {
+                      bubble("একটু অপেক্ষা করুন, আগের কাজ চলছে।", false)
+                      return
+                  }
+                  if (!llm.ready) {
+                      bubble("মডেল এখনো প্রস্তুত নয়। ফোন কমান্ড কাজ করবে; চ্যাটের জন্য মেনু থেকে মডেল নামান।", false)
+                      return
+                  }
+                  busy = true
+                  scope.launch {
+                      try {
+                          var prompt = text
+                          if (Web.wantsWeb(text)) {
+                              if (Web.isOnline(this@MainActivity)) {
+                                  val note = bubble("🌐 ইন্টারনেটে খুঁজছি...", false)
+                                  val ctx = withContext(Dispatchers.IO) {
+                                      try {
+                                          Web.search(Web.stripPrefix(text).ifBlank { text })
+                                      } catch (e: Exception) {
+                                          ""
+                                      }
+                                  }
+                                  chat.removeView(note)
+                                  if (ctx.isNotBlank()) {
+                                      prompt = "ইন্টারনেট থেকে পাওয়া তথ্য:\n$ctx\n\nপ্রশ্ন: $text\n" +
+                                          "উপরের তথ্য ব্যবহার করে সংক্ষেপে উত্তর দাও।"
+                                  }
+                              } else {
+                                  bubble("(ইন্টারনেট নেই, অফলাইন জ্ঞান থেকে বলছি। তথ্য পুরনো হতে পারে)", false)
+                              }
+                          }
+                          val out = bubble("…", false)
+                          var acc = ""
+                          try {
+                              llm.ask(prompt).flowOn(Dispatchers.Default).collect {
+                                  acc += it
+                                  out.text = cleanThink(acc)
+                                  scrollDown()
+                              }
+                          } catch (e: Throwable) {
+                              out.text = "ত্রুটি: ${e.message}"
+                          }
+                          speakOut(out.text.toString())
+                      } finally {
+                          busy = false
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------ ভয়েস ইনপুট
+              private fun listen() {
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                      .putExtra(RecognizerIntent.EXTRA_PROMPT, "বলুন...")
+                  try {
+                      startActivityForResult(i, reqSpeech)
+                  } catch (e: Exception) {
+                      toast("ভয়েস ইনপুট পাওয়া গেল না। Google অ্যাপ আপডেট আছে কি দেখুন।")
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK || data == null) return
+                  when (requestCode) {
+                      reqSpeech -> data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                          ?.firstOrNull()?.let { onSend(it) }
+                      reqFile -> data.data?.let { copyModel(it) }
+                  }
+              }
+
+              // ------------------------------------------------------------ মডেল ম্যানেজমেন্ট
+              private fun chooseModel() {
+                  AlertDialog.Builder(this)
+                      .setTitle("মডেল বেছে নিন")
+                      .setItems(
+                          arrayOf(
+                              "ভালো মডেল (Qwen3 4B, প্রায় 2.5 GB)",
+                              "ছোট ও দ্রুত (Qwen3 0.6B, প্রায় 0.5 GB)",
+                              "ফোনের ফাইল থেকে (.litertlm)"
+                          )
+                      ) { _, which ->
+                          when (which) {
+                              0 -> startDownload(url4b)
+                              1 -> startDownload(url06b)
+                              2 -> pickFile()
+                          }
+                      }
+                      .show()
+              }
+
+              private fun pickFile() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                      .addCategory(Intent.CATEGORY_OPENABLE)
+                      .setType("*/*")
+                  try {
+                      startActivityForResult(i, reqFile)
+                  } catch (e: Exception) {
+                      toast("ফাইল বাছাই খোলা গেল না")
+                  }
+              }
+
+              private fun startDownload(url: String) {
+                  if (busy) {
+                      toast("আগের কাজ চলছে")
+                      return
+                  }
+                  val tv = bubble("মডেল নামানো শুরু... অ্যাপ খোলা রেখে ওয়াই-ফাইতে অপেক্ষা করুন।", false)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  busy = true
+                  scope.launch {
+                      val err = withContext(Dispatchers.IO) {
+                          try {
+                              download(url) { msg -> runOnUiThread { tv.text = msg } }
+                              null
+                          } catch (e: Exception) {
+                              e.message ?: e.toString()
+                          }
+                      }
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                      busy = false
+                      if (err == null) {
+                          tv.text = "মডেল নামানো শেষ।"
+                          loadModel()
+                      } else {
+                          tv.text = "নামানো যায়নি: $err\n(নেট ঠিক হলে মেনু থেকে আবার চাপুন, যেখানে থেমেছিল সেখান থেকে চলবে। অথবা ফোনের ফাইল থেকে মডেল দিন।)"
+                      }
+                  }
+              }
+
+              private fun download(url: String, progress: (String) -> Unit) {
+                  val part = File(filesDir, "model.part")
+                  if (prefs.getString("dl_url", "") != url) part.delete()
+                  prefs.edit().putString("dl_url", url).apply()
+                  val have = if (part.exists()) part.length() else 0L
+
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 15000
+                  conn.readTimeout = 30000
+                  if (have > 0) conn.setRequestProperty("Range", "bytes=$have-")
+                  conn.connect()
+                  val code = conn.responseCode
+                  if (code == 416) {
+                      llm.close()
+                      llm.modelFile.delete()
+                      part.renameTo(llm.modelFile)
+                      return
+                  }
+                  if (code != 200 && code != 206) {
+                      val extra = if (code == 401 || code == 403) " (এই মডেল নামাতে লগইন লাগছে, ফোনের ফাইল থেকে দিন)" else ""
+                      throw IOException("সার্ভার উত্তর: $code$extra")
+                  }
+                  val append = code == 206
+                  var done = if (append) have else 0L
+                  val total = conn.contentLengthLong + (if (append) have else 0L)
+                  var last = 0L
+                  val buf = ByteArray(256 * 1024)
+                  FileOutputStream(part, append).use { out ->
+                      conn.inputStream.use { inp ->
+                          while (true) {
+                              val n = inp.read(buf)
+                              if (n < 0) break
+                              out.write(buf, 0, n)
+                              done += n
+                              val now = System.currentTimeMillis()
+                              if (now - last > 700) {
+                                  last = now
+                                  val pct = if (total > 0) done * 100 / total else 0
+                                  progress("মডেল নামছে: ${done / 1048576} MB / ${total / 1048576} MB ($pct%)")
+                              }
+                          }
+                      }
+                  }
+                  llm.close()
+                  llm.modelFile.delete()
+                  if (!part.renameTo(llm.modelFile)) throw IOException("ফাইল সেভ করা যায়নি")
+              }
+
+              private fun copyModel(uri: Uri) {
+                  if (busy) {
+                      toast("আগের কাজ চলছে")
+                      return
+                  }
+                  val tv = bubble("ফাইল কপি হচ্ছে...", false)
+                  busy = true
+                  scope.launch {
+                      val err = withContext(Dispatchers.IO) {
+                          try {
+                              llm.close()
+                              val part = File(filesDir, "model.part")
+                              var done = 0L
+                              var last = 0L
+                              contentResolver.openInputStream(uri)!!.use { inp ->
+                                  FileOutputStream(part).use { out ->
+                                      val buf = ByteArray(256 * 1024)
+                                      while (true) {
+                                          val n = inp.read(buf)
+                                          if (n < 0) break
+                                          out.write(buf, 0, n)
+                                          done += n
+                                          val now = System.currentTimeMillis()
+                                          if (now - last > 700) {
+                                              last = now
+                                              runOnUiThread { tv.text = "কপি হচ্ছে: ${done / 1048576} MB" }
+                                          }
+                                      }
+                                  }
+                              }
+                              llm.modelFile.delete()
+                              if (!part.renameTo(llm.modelFile)) throw IOException("ফাইল সেভ করা যায়নি")
+                              null
+                          } catch (e: Exception) {
+                              e.message ?: e.toString()
+                          }
+                      }
+                      busy = false
+                      if (err == null) {
+                          tv.text = "ফাইল কপি শেষ।"
+                          loadModel()
+                      } else {
+                          tv.text = "কপি করা যায়নি: $err"
+                      }
+                  }
+              }
+
+              private fun loadModel() {
+                  if (busy) return
+                  val tv = bubble("মডেল লোড হচ্ছে... (প্রথমবার ২০-৩০ সেকেন্ড লাগতে পারে)", false)
+                  busy = true
+                  prefs.edit().putBoolean("loading", true).apply()
+                  val backend = prefs.getString("backend", "CPU") ?: "CPU"
+                  scope.launch {
+                      val err = withContext(Dispatchers.IO) {
+                          try {
+                              llm.load(systemPrompt(), backend)
+                              null
+                          } catch (t: Throwable) {
+                              t.message ?: t.toString()
+                          }
+                      }
+                      prefs.edit().putBoolean("loading", false).apply()
+                      busy = false
+                      tv.text = if (err == null) {
+                          "প্রস্তুত! (${llm.backendName}) যেকোনো প্রশ্ন করুন, বাংলা বা ইংরেজিতে।"
+                      } else {
+                          "মডেল চালু হয়নি: $err\nমেনু থেকে 'CPU/GPU বদলান' বা ছোট মডেল (0.6B) চেষ্টা করুন। ফোন কমান্ড তবু কাজ করবে।"
+                      }
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/personal/ai'
+          cat > 'app/src/main/java/com/personal/ai/PhoneControl.kt' <<'__EOF__'
+          package com.personal.ai
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.BatteryManager
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.provider.Settings
+          import android.telephony.SmsManager
+          import java.time.LocalDateTime
+          import java.time.format.DateTimeFormatter
+
+          /** ফোন কন্ট্রোল: সবই অফলাইনে কাজ করে। */
+          class PhoneControl(private val act: Activity) {
+              private val prefs = act.getSharedPreferences("ai", Context.MODE_PRIVATE)
+
+              /** নোট বদলালে true হয়, যাতে মডেল নতুন নোট জানতে পারে। */
+              var notesChanged = false
+              private var torchOn = false
+
+              fun name(): String = prefs.getString("name", "") ?: ""
+              fun setName(n: String) {
+                  prefs.edit().putString("name", n).apply()
+              }
+
+              fun notes(): List<String> =
+                  (prefs.getString("notes", "") ?: "").split("\n").filter { it.isNotBlank() }
+
+              private fun saveNotes(l: List<String>) {
+                  prefs.edit().putString("notes", l.joinToString("\n")).apply()
+                  notesChanged = true
+              }
+
+              fun clearNotes() = saveNotes(emptyList())
+
+              private fun norm(s: String): String {
+                  val sb = StringBuilder()
+                  for (ch in s) {
+                      val i = "০১২৩৪৫৬৭৮৯".indexOf(ch)
+                      sb.append(if (i >= 0) ('0' + i) else ch)
+                  }
+                  return sb.toString().trim()
+              }
+
+              private fun has(t: String, vararg w: String) = w.any { t.contains(it) }
+
+              private val bnWeekdays = listOf("সোমবার", "মঙ্গলবার", "বুধবার", "বৃহস্পতিবার", "শুক্রবার", "শনিবার", "রবিবার")
+
+              private val aliases = linkedMapOf(
+                  "ইউটিউব" to "youtube", "হোয়াটসঅ্যাপ" to "whatsapp", "হোয়াটসএপ" to "whatsapp",
+                  "ফেসবুক" to "facebook", "মেসেঞ্জার" to "messenger", "ক্রোম" to "chrome",
+                  "ক্যামেরা" to "camera", "সেটিংস" to "settings", "সেটিং" to "settings",
+                  "গ্যালারি" to "gallery", "ক্যালকুলেটর" to "calculator", "ঘড়ি" to "clock",
+                  "মেসেজ" to "messages", "ম্যাপস" to "maps", "ম্যাপ" to "maps", "জিমেইল" to "gmail",
+                  "টেলিগ্রাম" to "telegram", "ইনস্টাগ্রাম" to "instagram", "ইন্সটাগ্রাম" to "instagram",
+                  "টিকটক" to "tiktok", "বিকাশ" to "bkash", "নগদ" to "nagad", "ইমো" to "imo",
+                  "প্লে স্টোর" to "play store", "ডায়ালার" to "phone", "ফাইল" to "my files"
+              )
+
+              val help = """কী কী বলতে পারেন:
+          • টর্চ জ্বালাও / টর্চ নিভাও
+          • ভলিউম 50 / ভলিউম বাড়াও / ভলিউম কমাও
+          • ব্রাইটনেস 70
+          • সকাল 6:30 এ অ্যালার্ম দাও / রাত 10টায় অ্যালার্ম
+          • 5 মিনিটের টাইমার
+          • রাহুলকে কল দাও / কল 017XXXXXXXX
+          • sms 017XXXXXXXX কেমন আছো
+          • ইউটিউব খোলো (যেকোনো অ্যাপের নাম)
+          • ওয়াইফাই খোলো / ব্লুটুথ খোলো
+          • ব্যাটারি কত / এখন কয়টা বাজে
+          • মনে রাখো আমার জন্মদিন ৫ মার্চ
+          • সার্চ ... / আজকের খবর / আবহাওয়া (নেট লাগবে)
+          • বাকি সব প্রশ্ন সরাসরি জিজ্ঞেস করুন"""
+
+              private fun need(perm: String): Boolean {
+                  if (act.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED) return true
+                  act.requestPermissions(arrayOf(perm), 11)
+                  return false
+              }
+
+              /** ফোন কমান্ড হলে উত্তর দেয়, নইলে null। */
+              fun handle(raw: String): String? {
+                  val text = norm(raw)
+                  val t = text.lowercase()
+                  val nums = Regex("\\d+").findAll(t).mapNotNull { it.value.toLongOrNull() }.toList()
+
+                  if (t == "সাহায্য" || t == "help" || t == "হেল্প") return help
+
+                  // স্মৃতি
+                  Regex("^(মনে রাখো|মনে রাখ|remember)[\\s,:]*(.+)", RegexOption.IGNORE_CASE).find(text)?.let {
+                      saveNotes(notes() + it.groupValues[2].trim())
+                      return "মনে রাখলাম।"
+                  }
+                  if (has(t, "সব ভুলে যাও", "forget everything")) {
+                      clearNotes()
+                      return "সব নোট মুছে ফেললাম।"
+                  }
+                  if (has(t, "কী কী মনে রেখেছ", "কি কি মনে রেখেছ", "my notes")) {
+                      val n = notes()
+                      return if (n.isEmpty()) "এখনো কিছু মনে রাখিনি।" else n.joinToString("\n") { "• $it" }
+                  }
+
+                  // টর্চ চালু থাকলে শুধু "বন্ধ করো / নিভাও" বললেই নিভবে
+                  if (torchOn && t.trim() in setOf("বন্ধ করো", "বন্ধ কর", "বন্ধ", "বন্ধ করে দাও", "নিভাও", "নিভিয়ে দাও", "off", "stop", "স্টপ", "থামাও")) {
+                      return torch(false)
+                  }
+                  // টর্চ
+                  if (has(t, "টর্চ", "torch", "flashlight", "ফ্ল্যাশলাইট")) {
+                      return torch(!has(t, "নিভ", "বন্ধ", "অফ", "off"))
+                  }
+
+                  // ভলিউম
+                  if (has(t, "ভলিউম", "volume", "আওয়াজ", "সাউন্ড")) {
+                      val am = act.getSystemService(AudioManager::class.java)
+                      val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                      if (nums.isNotEmpty()) {
+                          val pct = nums[0].coerceIn(0, 100).toInt()
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(pct * max / 100f), AudioManager.FLAG_SHOW_UI)
+                          return "ভলিউম $pct% করলাম।"
+                      }
+                      if (has(t, "বাড়া", "up", "increase")) {
+                          repeat(2) { am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI) }
+                          return "ভলিউম বাড়ালাম।"
+                      }
+                      if (has(t, "কমা", "down", "decrease")) {
+                          repeat(2) { am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI) }
+                          return "ভলিউম কমালাম।"
+                      }
+                      if (has(t, "ফুল", "max")) {
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, max, AudioManager.FLAG_SHOW_UI)
+                          return "ভলিউম সর্বোচ্চ করলাম।"
+                      }
+                  }
+
+                  // ব্রাইটনেস
+                  if (has(t, "ব্রাইটনেস", "brightness") && nums.isNotEmpty()) {
+                      return brightness(nums[0].coerceIn(0, 100).toInt())
+                  }
+
+                  // অ্যালার্ম
+                  if (has(t, "অ্যালার্ম", "এলার্ম", "অ্যালারাম", "alarm") && nums.isNotEmpty()) {
+                      val m = Regex("(\\d{1,2})\\s*[:.]\\s*(\\d{2})").find(t)
+                      var h: Int
+                      val mi: Int
+                      if (m != null) {
+                          h = m.groupValues[1].toInt()
+                          mi = m.groupValues[2].toInt()
+                      } else {
+                          h = nums[0].toInt()
+                          mi = if (nums.size > 1) nums[1].toInt() else 0
+                      }
+                      if (has(t, "বিকাল", "বিকেল", "সন্ধ্যা", "রাত", "pm") && h < 12) h += 12
+                      if (h in 0..23 && mi in 0..59) return setAlarm(h, mi)
+                  }
+
+                  // টাইমার
+                  if (has(t, "টাইমার", "timer") && nums.isNotEmpty()) {
+                      val n = nums[0].coerceAtMost(86400)
+                      val secs = when {
+                          has(t, "ঘণ্টা", "ঘন্টা", "hour") -> n * 3600
+                          has(t, "সেকেন্ড", "sec") -> n
+                          else -> n * 60
+                      }
+                      return setTimer(secs.toInt())
+                  }
+
+                  // এসএমএস: sms 017... হ্যালো
+                  Regex("^sms\\s+(\\+?\\d+)\\s+(.+)", RegexOption.IGNORE_CASE).find(text)?.let {
+                      return sendSms(it.groupValues[1], it.groupValues[2])
+                  }
+
+                  // কল
+                  if (has(t, "কল", "call", "ফোন করো", "ফোন দাও", "ফোন কর")) {
+                      val numMatch = Regex("\\+?\\d[\\d\\s-]{6,}\\d").find(text)
+                      var number: String? = null
+                      var who: String? = null
+                      if (numMatch != null) {
+                          number = numMatch.value.replace(Regex("[\\s-]"), "")
+                          who = number
+                      } else if (act.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
+                          val c = findContact(t)
+                          if (c != null) {
+                              who = c.first
+                              number = c.second
+                          }
+                      } else {
+                          act.requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 12)
+                          return "কনটাক্ট দেখার পারমিশন দিন, তারপর আবার বলুন।"
+                      }
+                      if (number != null) return call(who ?: number, number)
+                  }
+
+                  // ব্যাটারি
+                  if (has(t, "ব্যাটারি", "battery", "চার্জ কত")) {
+                      val i = act.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      val level = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                      val scale = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                      val st = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                      val charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+                      return if (level < 0) "ব্যাটারির তথ্য পেলাম না।"
+                      else "ব্যাটারি ${level * 100 / scale}%, ${if (charging) "চার্জ হচ্ছে" else "চার্জ হচ্ছে না"}।"
+                  }
+
+                  // সময়/তারিখ
+                  if (has(t, "কয়টা বাজে", "এখন কয়টা", "সময় কত", "what time", "আজকের তারিখ", "আজ কত তারিখ",
+                          "what date", "আজ কী বার", "আজ কি বার")) {
+                      val n = LocalDateTime.now()
+                      return "এখন ${n.format(DateTimeFormatter.ofPattern("hh:mm a"))}, ${bnWeekdays[n.dayOfWeek.value - 1]}, " +
+                          "তারিখ ${n.format(DateTimeFormatter.ofPattern("dd-MM-yyyy"))}।"
+                  }
+
+                  // ওয়াই-ফাই / ব্লুটুথ (অ্যান্ড্রয়েড সরাসরি অন-অফ করতে দেয় না, প্যানেল খুলে দিই)
+                  if (has(t, "ওয়াইফাই", "ওয়াই-ফাই", "wifi", "wi-fi", "ইন্টারনেট সেটিং") &&
+                      has(t, "অন", "অফ", "চালু", "বন্ধ", "খোল", "খুল", "on", "off", "open")) {
+                      return try {
+                          act.startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY))
+                          "ওয়াই-ফাই প্যানেল খুলেছি, সেখান থেকে অন/অফ করুন।"
+                      } catch (e: Exception) {
+                          "ওয়াই-ফাই প্যানেল খোলা গেল না।"
+                      }
+                  }
+                  if (has(t, "ব্লুটুথ", "bluetooth") &&
+                      has(t, "অন", "অফ", "চালু", "বন্ধ", "খোল", "খুল", "on", "off", "open")) {
+                      return try {
+                          act.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                          "ব্লুটুথ সেটিংস খুলেছি, সেখান থেকে অন/অফ করুন।"
+                      } catch (e: Exception) {
+                          "ব্লুটুথ সেটিংস খোলা গেল না।"
+                      }
+                  }
+
+                  // অ্যাপ খোলা
+                  if (has(t, "খোল", "খুল", "open", "ওপেন", "চালু কর", "launch", "চালাও")) {
+                      openApp(t)?.let { return it }
+                  }
+
+                  return null
+              }
+
+              private fun torch(on: Boolean): String {
+                  return try {
+                      val cm = act.getSystemService(CameraManager::class.java)
+                      val id = cm.cameraIdList.firstOrNull {
+                          cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                      } ?: return "এই ফোনে ফ্ল্যাশ পাওয়া গেল না।"
+                      cm.setTorchMode(id, on)
+                      torchOn = on
+                      if (on) "টর্চ জ্বালালাম।" else "টর্চ বন্ধ করলাম।"
+                  } catch (e: Exception) {
+                      "টর্চ চালানো গেল না: ${e.message}"
+                  }
+              }
+
+              private fun brightness(pct: Int): String {
+                  if (!Settings.System.canWrite(act)) {
+                      try {
+                          act.startActivity(
+                              Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:" + act.packageName))
+                          )
+                      } catch (_: Exception) {
+                      }
+                      return "সেটিংস পরিবর্তনের অনুমতি দিন (খোলা পেজে অ্যাপটি অন করুন), তারপর আবার বলুন।"
+                  }
+                  return try {
+                      val cr = act.contentResolver
+                      Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+                      Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, Math.round(pct * 255 / 100f))
+                      "ব্রাইটনেস $pct% করলাম।"
+                  } catch (e: Exception) {
+                      "ব্রাইটনেস বদলানো গেল না: ${e.message}"
+                  }
+              }
+
+              private fun setAlarm(h: Int, m: Int): String {
+                  fun intent(skip: Boolean) = Intent(AlarmClock.ACTION_SET_ALARM)
+                      .putExtra(AlarmClock.EXTRA_HOUR, h)
+                      .putExtra(AlarmClock.EXTRA_MINUTES, m)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, skip)
+                  return try {
+                      act.startActivity(intent(true))
+                      "অ্যালার্ম সেট করলাম %02d:%02d-এ।".format(h, m)
+                  } catch (e: Exception) {
+                      try {
+                          act.startActivity(intent(false))
+                          "ঘড়ি অ্যাপ খুলেছি %02d:%02d দিয়ে। শুধু সেভ চাপুন।".format(h, m)
+                      } catch (e2: Exception) {
+                          "অ্যালার্ম সেট করা গেল না: ${e2.message}"
+                      }
+                  }
+              }
+
+              private fun setTimer(secs: Int): String {
+                  fun intent(skip: Boolean) = Intent(AlarmClock.ACTION_SET_TIMER)
+                      .putExtra(AlarmClock.EXTRA_LENGTH, secs)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, skip)
+                  return try {
+                      act.startActivity(intent(true))
+                      "টাইমার চালু করলাম ($secs সেকেন্ড)।"
+                  } catch (e: Exception) {
+                      try {
+                          act.startActivity(intent(false))
+                          "ঘড়ি অ্যাপে টাইমার তৈরি করেছি, স্টার্ট চাপুন।"
+                      } catch (e2: Exception) {
+                          "টাইমার দেওয়া গেল না: ${e2.message}"
+                      }
+                  }
+              }
+
+              private fun findContact(t: String): Pair<String, String>? {
+                  try {
+                      act.contentResolver.query(
+                          ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                          arrayOf(
+                              ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                              ContactsContract.CommonDataKinds.Phone.NUMBER
+                          ),
+                          null, null, null
+                      )?.use { c ->
+                          while (c.moveToNext()) {
+                              val name = c.getString(0) ?: continue
+                              val num = c.getString(1) ?: continue
+                              if (name.length >= 2 && t.contains(name.lowercase())) return name to num
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+                  return null
+              }
+
+              private fun call(who: String, number: String): String {
+                  if (!need(Manifest.permission.CALL_PHONE)) return "কল করার পারমিশন দিন, তারপর আবার বলুন।"
+                  return try {
+                      act.startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number))))
+                      "$who-কে কল করছি।"
+                  } catch (e: Exception) {
+                      "কল করা গেল না: ${e.message}"
+                  }
+              }
+
+              private fun sendSms(number: String, body: String): String {
+                  if (!need(Manifest.permission.SEND_SMS)) return "এসএমএস পাঠানোর পারমিশন দিন, তারপর আবার বলুন।"
+                  return try {
+                      val sms = act.getSystemService(SmsManager::class.java)
+                      sms.sendMultipartTextMessage(number, null, sms.divideMessage(body), null, null)
+                      "মেসেজ পাঠালাম।"
+                  } catch (e: Exception) {
+                      "মেসেজ যায়নি: ${e.message}"
+                  }
+              }
+
+              private fun openApp(t0: String): String? {
+                  var t = t0
+                  for ((bn, en) in aliases) t = t.replace(bn, en)
+                  val pm = act.packageManager
+                  val list = pm.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+                  )
+                  var bestLabel = ""
+                  var bestPkg: String? = null
+                  for (ri in list) {
+                      val l = ri.loadLabel(pm).toString().lowercase()
+                      if (l.length >= 2 && (t.contains(l) || t0.contains(l)) && l.length > bestLabel.length) {
+                          bestLabel = l
+                          bestPkg = ri.activityInfo.packageName
+                      }
+                  }
+                  val pkg = bestPkg ?: return null
+                  val launch = pm.getLaunchIntentForPackage(pkg) ?: return null
+                  return try {
+                      act.startActivity(launch)
+                      "$bestLabel খুলছি।"
+                  } catch (e: Exception) {
+                      "অ্যাপ খোলা গেল না: ${e.message}"
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/personal/ai'
+          cat > 'app/src/main/java/com/personal/ai/WebTools.kt' <<'__EOF__'
+          package com.personal.ai
+
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.text.Html
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          /** ইন্টারনেট থাকলে তথ্য আনার টুল। */
+          object Web {
+              private val prefixes = listOf(
+                  "সার্চ", "search", "খুঁজো", "খুঁজে", "খোঁজ", "নেট থেকে", "ইন্টারনেট থেকে", "গুগল"
+              )
+              private val words = listOf(
+                  "খবর", "news", "আবহাওয়া", "weather", "দাম কত", "price", "স্কোর", "score", "সর্বশেষ", "latest", "আজকের"
+              )
+
+              fun wantsWeb(text: String): Boolean {
+                  val t = text.lowercase().trim()
+                  return prefixes.any { t.startsWith(it) } || words.any { t.contains(it) }
+              }
+
+              fun stripPrefix(text: String): String {
+                  var t = text.trim()
+                  for (p in prefixes) {
+                      if (t.lowercase().startsWith(p)) {
+                          t = t.substring(p.length).trim()
+                          break
+                      }
+                  }
+                  return t
+              }
+
+              fun isOnline(ctx: Context): Boolean {
+                  val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return false
+                  val net = cm.activeNetwork ?: return false
+                  val caps = cm.getNetworkCapabilities(net) ?: return false
+                  return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                      caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+              }
+
+              private fun get(url: String): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 10000
+                  c.readTimeout = 12000
+                  c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 15) Mobile")
+                  return c.inputStream.bufferedReader().use { it.readText() }
+              }
+
+              private fun clean(s: String): String =
+                  Html.fromHtml(s, Html.FROM_HTML_MODE_LEGACY).toString().trim()
+
+              private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+              /** ব্লকিং কল — ব্যাকগ্রাউন্ড থ্রেডে চালাতে হবে। */
+              fun search(query: String, city: String = "Dhaka"): String {
+                  val out = ArrayList<String>()
+                  val q = query.lowercase()
+                  if (q.contains("আবহাওয়া") || q.contains("weather") || q.contains("তাপমাত্রা")) {
+                      try {
+                          val w = get("https://wttr.in/${enc(city)}?format=%25C+%25t+humidity+%25h+wind+%25w").trim()
+                          out.add("আবহাওয়া ($city): $w")
+                      } catch (_: Exception) {
+                      }
+                  }
+                  try {
+                      val page = get("https://html.duckduckgo.com/html/?q=${enc(query)}")
+                      val titles = Regex("class=\"result__a\"[^>]*>(.*?)</a>", RegexOption.DOT_MATCHES_ALL)
+                          .findAll(page).map { clean(it.groupValues[1]) }.toList()
+                      val snips = Regex("class=\"result__snippet\"[^>]*>(.*?)</a>", RegexOption.DOT_MATCHES_ALL)
+                          .findAll(page).map { clean(it.groupValues[1]) }.toList()
+                      for (i in 0 until minOf(titles.size, snips.size, 5)) {
+                          out.add("${titles[i]}: ${snips[i]}")
+                      }
+                  } catch (_: Exception) {
+                  }
+                  if (out.size < 2) {
+                      for (lang in listOf("bn", "en")) {
+                          try {
+                              val u = "https://$lang.wikipedia.org/w/api.php?action=query&list=search&format=json" +
+                                  "&srlimit=3&srsearch=${enc(query)}"
+                              val arr = JSONObject(get(u)).getJSONObject("query").getJSONArray("search")
+                              for (i in 0 until arr.length()) {
+                                  val it = arr.getJSONObject(i)
+                                  out.add("${it.getString("title")}: ${clean(it.getString("snippet"))}")
+                              }
+                          } catch (_: Exception) {
+                          }
+                          if (out.isNotEmpty()) break
+                      }
+                  }
+                  val joined = out.joinToString("\n") { "- $it" }
+                  return if (joined.length > 1500) joined.substring(0, 1500) else joined
+              }
+          }
+          __EOF__
+          mkdir -p 'app/src/main/java/com/personal/ai'
+          cat > 'app/src/main/java/com/personal/ai/Assist.kt' <<'__EOF__'
+          package com.personal.ai
+
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.service.voice.VoiceInteractionService
+          import android.service.voice.VoiceInteractionSession
+          import android.service.voice.VoiceInteractionSessionService
+
+          /** ফোনের "ডিফল্ট ডিজিটাল অ্যাসিস্ট্যান্ট" হিসেবে বেছে নেওয়ার জন্য। */
+          class AssistService : VoiceInteractionService()
+
+          class AssistSessionService : VoiceInteractionSessionService() {
+              override fun onNewSession(args: Bundle?): VoiceInteractionSession = AssistSession(this)
+          }
+
+          class AssistSession(ctx: Context) : VoiceInteractionSession(ctx) {
+              override fun onShow(args: Bundle?, showFlags: Int) {
+                  super.onShow(args, showFlags)
+                  val i = Intent(context, MainActivity::class.java).putExtra("listen", true)
+                  try {
+                      startAssistantActivity(i)
+                  } catch (e: Exception) {
+                      try {
+                          context.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      } catch (_: Exception) {
+                      }
+                  }
+                  hide()
+              }
+          }
+
+          /** অ্যাসিস্ট্যান্ট হিসেবে রেজিস্টার করতে একটা খালি রিকগনিশন সার্ভিস লাগে। */
+          class StubRecognitionService : android.speech.RecognitionService() {
+              override fun onStartListening(recognizerIntent: Intent?, listener: android.speech.RecognitionService.Callback?) {}
+              override fun onCancel(listener: android.speech.RecognitionService.Callback?) {}
+              override fun onStopListening(listener: android.speech.RecognitionService.Callback?) {}
+          }
+          __EOF__
+          mkdir -p 'app/src/main/res/xml'
+          cat > 'app/src/main/res/xml/voice_interaction_service.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:sessionService="com.personal.ai.AssistSessionService"
+              android:recognitionService="com.personal.ai.StubRecognitionService"
+              android:supportsAssist="true" />
+          __EOF__
+          cat > 'build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.3.0" apply false
+          }
+          __EOF__
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __EOF__
+          cat > 'settings.gradle.kts' <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PersonalAI"
+          include(":app")
+          __EOF__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+      - name: Build APK
+        shell: bash
+        run: gradle assembleDebug --no-daemon 2>&1 | tee build.log
+      - name: Show errors
+        if: failure()
+        shell: bash
+        run: |
+          echo '### Build errors' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^e: |What went wrong|Execution failed|Could not |error:' build.log | cut -c1-300 | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MunnaAI-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk MunnaAI.apk
+          gh release create "v${{ github.run_number }}" MunnaAI.apk --repo "${{ github.repository }}" --title "Munna AI v${{ github.run_number }}" --notes "Download MunnaAI.apk and install it on your phone."
